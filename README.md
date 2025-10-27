@@ -52,7 +52,7 @@ Required environment variables:
 ```bash
 export AWS_ACCESS_KEY_ID="your-key"
 export AWS_SECRET_ACCESS_KEY="your-secret"
-export AWS_DEFAULT_REGION="us-east-1"
+export AWS_DEFAULT_REGION="eu-west-2" # MUST match your NACLs' region
 ```
 
 ## Dependencies

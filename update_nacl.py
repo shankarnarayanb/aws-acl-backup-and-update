@@ -10,6 +10,7 @@ import sys
 import json
 from datetime import datetime
 
+# AWS_DEFAULT_REGION (e.g., eu-west-2) - MUST match the region where your NACLs are located
 # Configuration - UPDATE THESE VALUES
 NACL_IDS = [
     # 'acl-xxxxx',  # Add your Network ACL IDs here
