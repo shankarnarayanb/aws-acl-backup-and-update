@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 """
-AWS Network ACL Updater
-Updates outbound rules to allow only specific IP addresses and deny all other traffic
-Creates a backup before making changes for easy restoration
+AWS Network ACL Updater - Enhanced Version
+
+IMPORTANT: This script does NOT automatically consolidate IPs!
+You MUST run ip_consolidator.py first to:
+  1. Review consolidation opportunities
+  2. Confirm the consolidated ranges
+  3. Get the optimized IP list to paste here
+
+This script will:
+  - Check if you've consolidated (warns if too many /32 entries)
+  - Verify AWS limits before deploying
+  - Create backups before changes
+  - Use YOUR confirmed IP list (no auto-consolidation)
 """
 
 import boto3
 import sys
 import json
 from datetime import datetime
+import ipaddress
 
-# AWS_DEFAULT_REGION (e.g., eu-west-2) - MUST match the region where your NACLs are located
 # Configuration - UPDATE THESE VALUES
 NACL_IDS = [
     # 'acl-xxxxx',  # Add your Network ACL IDs here
@@ -29,23 +39,85 @@ DENY_ALL_RULE = 32766   # Rule number for deny all (just before default)
 # Backup configuration
 BACKUP_DIR = './nacl_backups'
 
+# AWS limits (can be increased via service quota request)
+DEFAULT_RULE_LIMIT = 20  # Per NACL (inbound + outbound combined)
+MAX_RULE_LIMIT = 40      # Maximum with quota increase
+
 
 def get_nacl_client():
     """Initialize EC2 client with credentials from environment"""
     return boto3.client('ec2')
 
 
-def get_existing_egress_rules(client, nacl_id):
-    """Get all existing egress rules for a NACL"""
+def consolidate_ip_ranges(ip_list):
+    """
+    Consolidate IP addresses into the smallest set of CIDR blocks.
+    This reduces the number of rules needed.
+    """
+    if not ip_list:
+        return []
+    
+    # Parse all IPs into network objects
+    networks = []
+    for ip_str in ip_list:
+        try:
+            networks.append(ipaddress.ip_network(ip_str, strict=False))
+        except ValueError as e:
+            print(f"Warning: Invalid IP address '{ip_str}': {e}")
+            continue
+    
+    if not networks:
+        return []
+    
+    # Sort networks
+    networks.sort()
+    
+    # Collapse adjacent/overlapping networks
+    consolidated = list(ipaddress.collapse_addresses(networks))
+    
+    return [str(net) for net in consolidated]
+
+
+def get_existing_rules(client, nacl_id):
+    """Get all existing rules (inbound and outbound) for a NACL"""
     response = client.describe_network_acls(NetworkAclIds=[nacl_id])
     
     if not response['NetworkAcls']:
         raise Exception(f"Network ACL {nacl_id} not found")
     
     nacl = response['NetworkAcls'][0]
-    egress_rules = [entry for entry in nacl['Entries'] if entry['Egress']]
     
-    return egress_rules
+    # Get both inbound and outbound rules (excluding default rule 32767)
+    all_rules = [entry for entry in nacl['Entries'] if entry['RuleNumber'] != 32767]
+    inbound_rules = [entry for entry in all_rules if not entry['Egress']]
+    egress_rules = [entry for entry in all_rules if entry['Egress']]
+    
+    return {
+        'inbound': inbound_rules,
+        'egress': egress_rules,
+        'total': len(all_rules)
+    }
+
+
+def check_rule_limits(client, nacl_id, new_egress_count, rule_limit):
+    """Check if adding new rules would exceed limits"""
+    existing = get_existing_rules(client, nacl_id)
+    
+    # Calculate new totals
+    # We'll delete existing egress rules and add new ones
+    # So total = existing inbound + new egress rules + 1 (deny all rule)
+    new_total = len(existing['inbound']) + new_egress_count + 1
+    
+    return {
+        'current_inbound': len(existing['inbound']),
+        'current_egress': len(existing['egress']),
+        'current_total': existing['total'],
+        'new_egress': new_egress_count,
+        'new_total': new_total,
+        'limit': rule_limit,
+        'within_limit': new_total <= rule_limit,
+        'rules_available': rule_limit - len(existing['inbound']) - 1  # -1 for deny all
+    }
 
 
 def save_backup(backup_data, backup_file):
@@ -65,7 +137,7 @@ def save_backup(backup_data, backup_file):
 
 def delete_egress_rule(client, nacl_id, rule_number):
     """Delete a specific egress rule"""
-    print(f"  Deleting rule {rule_number}")
+    print(f"  Deleting egress rule {rule_number}")
     client.delete_network_acl_entry(
         NetworkAclId=nacl_id,
         Egress=True,
@@ -103,20 +175,17 @@ def update_nacl(client, nacl_id, allowed_ips, backup_data):
     """Update a single NACL with new outbound rules"""
     print(f"\nProcessing NACL: {nacl_id}")
     
-    # Get existing egress rules
-    existing_rules = get_existing_egress_rules(client, nacl_id)
-    print(f"Found {len(existing_rules)} existing egress rules")
+    # Get existing rules for backup
+    existing = get_existing_rules(client, nacl_id)
     
     # Save backup data for this NACL
     backup_data['nacls'][nacl_id] = {
-        'egress_rules': existing_rules
+        'egress_rules': existing['egress']
     }
     
     # Delete all existing egress rules except the default (32767)
-    for rule in existing_rules:
-        rule_number = rule['RuleNumber']
-        if rule_number != 32767:  # Don't delete the default rule
-            delete_egress_rule(client, nacl_id, rule_number)
+    for rule in existing['egress']:
+        delete_egress_rule(client, nacl_id, rule['RuleNumber'])
     
     # Create allow rules for each IP
     rule_number = ALLOW_RULE_START
@@ -142,23 +211,103 @@ def main():
         print("Please edit the script and add the IP addresses to allow")
         sys.exit(1)
     
-    print("=" * 60)
-    print("AWS Network ACL Outbound Rules Updater")
-    print("=" * 60)
-    print(f"\nNACLs to update: {len(NACL_IDS)}")
-    print(f"Allowed IPs: {len(ALLOWED_IPS)}")
-    print("\nAllowed IP addresses:")
+    print("=" * 70)
+    print("AWS Network ACL Outbound Rules Updater (Enhanced)")
+    print("=" * 70)
+    
+    # Check if IPs look consolidated
+    print(f"\nIP list entries: {len(ALLOWED_IPS)}")
+    
+    # Warn if there are many /32 entries (likely not consolidated)
+    slash_32_count = sum(1 for ip in ALLOWED_IPS if ip.endswith('/32'))
+    if slash_32_count > 10:
+        print("\n" + "⚠️ " * 35)
+        print("⚠️  WARNING: You have many individual /32 IP addresses!")
+        print(f"⚠️  Found {slash_32_count} individual IPs out of {len(ALLOWED_IPS)} total entries")
+        print("⚠️ ")
+        print("⚠️  REQUIRED: Run ip_consolidator.py FIRST to:")
+        print("⚠️    1. See how many rules you can save")
+        print("⚠️    2. Review the consolidated ranges")
+        print("⚠️    3. Confirm the consolidation is acceptable")
+        print("⚠️    4. Get the optimized IP list to use here")
+        print("⚠️ ")
+        print("⚠️  Then copy the consolidated list back to this script")
+        print("⚠️ " * 35)
+        
+        response = input("\nHave you run ip_consolidator.py and confirmed these IPs? (yes/no): ")
+        if response.lower() != 'yes':
+            print("\n❌ Please run ip_consolidator.py first:")
+            print("   python3 ip_consolidator.py")
+            print("\nThen update ALLOWED_IPS in this script with the consolidated list.")
+            sys.exit(1)
+    
+    print("\nIP addresses to allow:")
     for ip in ALLOWED_IPS:
         print(f"  - {ip}")
     
-    print("\n" + "=" * 60)
-    response = input("Proceed with updates? (yes/no): ")
-    if response.lower() != 'yes':
-        print("Aborted.")
-        sys.exit(0)
+    # Determine rule limit
+    print("\n" + "=" * 70)
+    rule_limit_str = input(f"What is your NACL rule limit? (default: {DEFAULT_RULE_LIMIT}, max: {MAX_RULE_LIMIT}): ").strip()
+    if rule_limit_str:
+        try:
+            rule_limit = int(rule_limit_str)
+        except ValueError:
+            print("Invalid input, using default limit")
+            rule_limit = DEFAULT_RULE_LIMIT
+    else:
+        rule_limit = DEFAULT_RULE_LIMIT
     
+    print(f"\nUsing rule limit: {rule_limit}")
+    
+    # Check limits for each NACL
     try:
         client = get_nacl_client()
+        
+        print("\n" + "=" * 70)
+        print("Checking rule limits...")
+        
+        all_within_limits = True
+        limit_checks = {}
+        
+        for nacl_id in NACL_IDS:
+            check = check_rule_limits(client, nacl_id, len(ALLOWED_IPS), rule_limit)
+            limit_checks[nacl_id] = check
+            
+            print(f"\nNACL: {nacl_id}")
+            print(f"  Current rules: {check['current_total']} (Inbound: {check['current_inbound']}, Egress: {check['current_egress']})")
+            print(f"  New egress rules: {check['new_egress']}")
+            print(f"  Total after update: {check['new_total']} / {check['limit']}")
+            
+            if check['within_limit']:
+                print(f"  ✓ Within limit ({check['limit'] - check['new_total']} rules remaining)")
+            else:
+                print(f"  ✗ EXCEEDS LIMIT by {check['new_total'] - check['limit']} rules!")
+                print(f"  → You can only add {check['rules_available']} more egress rules")
+                all_within_limits = False
+        
+        if not all_within_limits:
+            print("\n" + "=" * 70)
+            print("❌ ERROR: Some NACLs would exceed rule limits!")
+            print("\nRequired steps:")
+            print("1. Run ip_consolidator.py to reduce your IP list:")
+            print("   python3 ip_consolidator.py")
+            print("2. Copy the consolidated IPs to ALLOWED_IPS in this script")
+            print("3. Run this script again")
+            print("\nOther options:")
+            print("• Request AWS quota increase (up to 40 rules per NACL)")
+            print("• Split resources across multiple subnets/NACLs")
+            print("• Remove unnecessary inbound rules")
+            sys.exit(1)
+        
+        # Show what will be updated
+        print("\n" + "=" * 70)
+        print(f"Ready to update {len(NACL_IDS)} NACL(s)")
+        print(f"Total rules to create: {len(ALLOWED_IPS) + 1} (allow rules + deny all)")
+        
+        response = input("\nProceed with updates? (yes/no): ")
+        if response.lower() != 'yes':
+            print("Aborted.")
+            sys.exit(0)
         
         # Prepare backup data
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -166,10 +315,12 @@ def main():
         backup_data = {
             'timestamp': timestamp,
             'datetime': datetime.now().isoformat(),
+            'ip_count': len(ALLOWED_IPS),
+            'allowed_ips': ALLOWED_IPS,
             'nacls': {}
         }
         
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("Creating backup...")
         
         for nacl_id in NACL_IDS:
@@ -178,15 +329,18 @@ def main():
         # Save backup after all updates
         backup_path = save_backup(backup_data, backup_file)
         
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("✓ All Network ACLs updated successfully!")
         print(f"✓ Backup saved to: {backup_path}")
+        print(f"✓ Created {len(ALLOWED_IPS)} allow rules + 1 deny all rule")
         print("\nTo restore from backup, run:")
         print(f"  python3 restore_nacl.py {backup_path}")
-        print("=" * 60)
+        print("=" * 70)
         
     except Exception as e:
         print(f"\n✗ ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
